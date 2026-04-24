@@ -124,8 +124,8 @@ fn run(args: RunArgs) -> Result<()> {
     let pack = db_pack::load(&args.db_pack)
         .with_context(|| format!("loading db_pack from {}", args.db_pack.display()))?;
     info!(
-        "  db_pack: n_samples={}, n_pcs={}, n_pruned={}",
-        pack.manifest.n_samples, pack.manifest.n_pcs, pack.manifest.n_sites_pruned,
+        "  db_pack: n_samples={}, n_pcs={}, n_ld_indep={}",
+        pack.manifest.n_samples, pack.manifest.n_pcs, pack.manifest.n_sites_ld_indep,
     );
 
     let n_controls = args.n_controls;

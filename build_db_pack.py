@@ -7,12 +7,12 @@ preprocessed db_pack. In production the preprocessing happens elsewhere.
 
 Outputs (in --out-dir):
     manifest.json          — version, reference_build, n_samples, n_pcs,
-                             n_sites, n_sites_pruned, age_mean, age_sd,
+                             n_sites, n_sites_ld_indep, age_mean, age_sd,
                              created_at
     samples.parquet        — sample_id, sex, age, population,
                              pc0..pc{n_pcs-1}
     sites.parquet          — ALL single-allelic db sites:
-                             chrom, pos, ref, alt, in_pruned
+                             chrom, pos, ref, alt, ld_indep
                              (row order = site_idx, 0..n_sites)
     geno_dense.parquet     — site-major dense dosages. One row per site,
                               one column per sample (named `sample_0` ..
@@ -20,18 +20,15 @@ Outputs (in --out-dir):
                               dosage encoding
                               {0=HOM_REF, 1=HET, 2=HOM_ALT, 255=MISSING}.
                               Zstd-compressed.
-    geno_pruned.bin        — sample-major sparse records for the pruned
-                             subset, used by refinement's incremental χ²:
-                             5-byte records (u32 site_idx LE, u8 dosage).
-                             site_idx refers to rows of sites.parquet
-                             (not a pruned-only sub-index).
-    geno_pruned.off        — u64 LE offsets into geno_pruned.bin,
-                             length n_samples + 1.
+    geno_ld_indep.parquet  — same layout as geno_dense.parquet but only the
+                             rows where ld_indep = True. Used by the
+                             refinement stage with column projection onto
+                             the candidate pool.
 
 Conventions:
   - A variant is included iff it is single-allelic in the VCF (one ALT).
-  - Dosage orientation follows the VCF's REF/ALT. For prune-set sites whose
-    bim alleles disagree with the VCF, `in_pruned = True` is still set, but
+  - Dosage orientation follows the VCF's REF/ALT. For ld-indep sites whose
+    bim alleles disagree with the VCF, `ld_indep = True` is still set, but
     glad-prep's query side labels those sites with the bim's alleles, so the
     refinement inner-join will drop them automatically. This keeps the VCF
     as the single source of truth for db dosages.
@@ -56,7 +53,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import struct
 import sys
 import time
 from datetime import datetime, timezone
@@ -106,7 +102,7 @@ def read_eigenvec(path: Path) -> tuple[list[str], np.ndarray]:
 def read_bim_prune_positions(
     bim_path: Path, prune_path: Path
 ) -> set[tuple[str, int]]:
-    """Parse bim + prune.in and return the set of (chrom, bp) for pruned sites."""
+    """Parse bim + prune.in and return the set of (chrom, bp) for LD-indep sites."""
     prune_snpids: set[str] = set()
     with open(prune_path) as f:
         for line in f:
@@ -223,9 +219,9 @@ def main() -> int:
         args.out_dir / "samples.parquet", sample_ids, meta_df, pca
     )
 
-    print(f"loading prune set from {args.bim} + {args.prune_in} ...")
-    prune_positions = read_bim_prune_positions(args.bim, args.prune_in)
-    print(f"  {len(prune_positions)} pruned (chrom, pos) keys")
+    print(f"loading LD-indep set from {args.bim} + {args.prune_in} ...")
+    ld_indep_positions = read_bim_prune_positions(args.bim, args.prune_in)
+    print(f"  {len(ld_indep_positions)} LD-independent (chrom, pos) keys")
 
     print(f"opening VCF {args.vcf} ...")
     vcf = VCF(str(args.vcf))
@@ -251,27 +247,31 @@ def main() -> int:
         [0, 1, DOSAGE_MISSING, 2], dtype=np.uint8
     )
 
-    # Dense genotype output: one row per site, one u8 column per sample.
-    # Stream row groups to avoid holding all n_sites × n_samples bytes in RAM.
     SITES_PER_CHUNK = 4096
     sample_names = [f"sample_{j}" for j in range(n_samples)]
     dense_schema = pa.schema([pa.field(name, pa.uint8()) for name in sample_names])
+
+    # Dense parquet: all sites.
     dense_path = args.out_dir / "geno_dense.parquet"
     dense_writer = pq.ParquetWriter(dense_path, dense_schema, compression="zstd")
     dense_buf = np.empty((SITES_PER_CHUNK, n_samples), dtype=np.uint8)
     dense_fill = 0
 
+    # LD-indep parquet: same schema, only LD-independent rows.
+    ld_indep_path = args.out_dir / "geno_ld_indep.parquet"
+    ld_indep_writer = pq.ParquetWriter(ld_indep_path, dense_schema, compression="zstd")
+    ld_indep_buf = np.empty((SITES_PER_CHUNK, n_samples), dtype=np.uint8)
+    ld_indep_fill = 0
+
     site_chroms: list[str] = []
     site_positions: list[int] = []
     site_refs: list[str] = []
     site_alts: list[str] = []
-    site_in_pruned: list[bool] = []
-
-    per_sample_buf: list[bytearray] = [bytearray() for _ in range(n_samples)]
+    site_ld_indep: list[bool] = []
 
     n_seen = 0
     n_multi_skipped = 0
-    n_pruned_emitted = 0
+    n_ld_indep_emitted = 0
     site_idx = 0
     t0 = time.time()
     progress_every = 50_000
@@ -295,11 +295,10 @@ def main() -> int:
         pos = variant.POS
         ref = variant.REF
         alt = alts[0]
-        in_pruned = (chrom, pos) in prune_positions
+        is_ld_indep = (chrom, pos) in ld_indep_positions
 
         # Compute per-sample dosage in eigenvec order.
         gt = np.asarray(variant.gt_types, dtype=np.int32)
-        # Clip any out-of-range values defensively (shouldn't occur).
         gt = np.where((gt >= 0) & (gt <= 3), gt, 2)
         gt_e = gt[perm]
         dosage = gt_to_dosage[gt_e]
@@ -308,7 +307,7 @@ def main() -> int:
         site_positions.append(pos)
         site_refs.append(ref)
         site_alts.append(alt)
-        site_in_pruned.append(in_pruned)
+        site_ld_indep.append(is_ld_indep)
 
         dense_buf[dense_fill] = dosage
         dense_fill += 1
@@ -316,15 +315,13 @@ def main() -> int:
             flush_dense_chunk(dense_writer, dense_buf, dense_fill, sample_names)
             dense_fill = 0
 
-        if in_pruned:
-            site_bytes = struct.pack("<I", site_idx)
-            # Non-hom-ref samples only (dosage != 0).
-            nonref_j = np.where(dosage != 0)[0]
-            for j in nonref_j:
-                buf = per_sample_buf[int(j)]
-                buf.extend(site_bytes)
-                buf.append(int(dosage[j]))
-            n_pruned_emitted += 1
+        if is_ld_indep:
+            ld_indep_buf[ld_indep_fill] = dosage
+            ld_indep_fill += 1
+            if ld_indep_fill == SITES_PER_CHUNK:
+                flush_dense_chunk(ld_indep_writer, ld_indep_buf, ld_indep_fill, sample_names)
+                ld_indep_fill = 0
+            n_ld_indep_emitted += 1
 
         site_idx += 1
 
@@ -332,7 +329,7 @@ def main() -> int:
     print(
         f"  scanned {n_seen} variants in {elapsed:.0f}s; "
         f"emitted {site_idx} sites (skipped {n_multi_skipped} multi-allelic); "
-        f"pruned subset = {n_pruned_emitted}"
+        f"LD-independent subset = {n_ld_indep_emitted}"
     )
     if site_idx == 0:
         raise SystemExit("no sites emitted; aborting")
@@ -343,6 +340,12 @@ def main() -> int:
     dense_size = dense_path.stat().st_size
     print(f"  geno_dense.parquet: {dense_size / 1e6:.1f} MB")
 
+    print("finalizing geno_ld_indep.parquet ...")
+    flush_dense_chunk(ld_indep_writer, ld_indep_buf, ld_indep_fill, sample_names)
+    ld_indep_writer.close()
+    ld_indep_size = ld_indep_path.stat().st_size
+    print(f"  geno_ld_indep.parquet: {ld_indep_size / 1e6:.1f} MB")
+
     print("writing sites.parquet ...")
     pl.DataFrame(
         {
@@ -350,27 +353,9 @@ def main() -> int:
             "pos": site_positions,
             "ref": site_refs,
             "alt": site_alts,
-            "in_pruned": site_in_pruned,
+            "ld_indep": site_ld_indep,
         }
     ).write_parquet(args.out_dir / "sites.parquet", compression="zstd")
-
-    print("writing geno_pruned.bin + .off ...")
-    bin_path = args.out_dir / "geno_pruned.bin"
-    off_path = args.out_dir / "geno_pruned.off"
-    offsets: list[int] = [0]
-    with open(bin_path, "wb") as bf:
-        for buf in per_sample_buf:
-            if buf:
-                bf.write(buf)
-            offsets.append(bf.tell())
-    with open(off_path, "wb") as of:
-        for o in offsets:
-            of.write(struct.pack("<Q", o))
-    bin_size = bin_path.stat().st_size
-    print(
-        f"  geno_pruned.bin: {bin_size / 1e6:.1f} MB ({bin_size // 5} records); "
-        f".off: {len(offsets)} u64 offsets"
-    )
 
     print("writing manifest.json ...")
     manifest = {
@@ -379,7 +364,7 @@ def main() -> int:
         "n_samples": n_samples,
         "n_pcs": n_pcs,
         "n_sites": site_idx,
-        "n_sites_pruned": n_pruned_emitted,
+        "n_sites_ld_indep": n_ld_indep_emitted,
         "age_mean": float(glad_meta["age_mean"]),
         "age_sd": float(glad_meta["age_sd"]),
         "created_at": datetime.now(timezone.utc).isoformat(),

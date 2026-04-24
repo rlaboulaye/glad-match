@@ -1,6 +1,6 @@
 //! Greedy refinement of the control set targeting genomic control λ → 1.
 //!
-//! Operates on the LD-pruned site set with **incremental χ²** updates per
+//! Operates on the LD-independent site set with **incremental χ²** updates per
 //! swap. The refinement objective is `(log λ)²`, which penalizes both
 //! inflation (`λ > 1`) and deflation (`λ < 1`) symmetrically — the prior
 //! approach minimized λ outright, which over-corrects in practice.
@@ -12,6 +12,11 @@
 //! floor against starvation. When sex-split, swaps are constrained
 //! within-sex (round-robin across strata) so the female/male ratio is
 //! preserved exactly.
+//!
+//! Candidate genotypes for the LD-independent sites are loaded up-front via
+//! column projection on `geno_ld_indep.parquet`, then kept in a
+//! `HashMap<db_idx, Vec<(ld_k, dosage)>>` sparse map for O(non-ref) swap
+//! evaluation without any further I/O.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,7 +28,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::candidates::{Candidate, Stratum};
 use crate::error::{Error, Result};
-use crate::io::db_pack::{DOSAGE_MISSING, DbPack};
+use crate::io::db_pack::{self, DOSAGE_MISSING, DbPack};
 use crate::io::query::Query;
 use crate::stats::{chi_square, lambda, log_lambda_sq};
 
@@ -67,14 +72,14 @@ pub struct RefineResult {
 
 // --- site alignment -------------------------------------------------------
 
-/// Inner-join between query.counts and the db's pruned site subset, keyed by
-/// (chrom, pos, ref, alt). Non-pruned sites are skipped.
+/// Inner-join between query.counts and the db's LD-independent site subset,
+/// keyed by (chrom, pos, ref, alt). Non-LD-independent sites are skipped.
 struct SiteAlignment {
-    /// For each active site k: (site_idx, query_count_idx).
+    /// For each active site k: (ld_k, query_count_idx).
     pairs: Vec<(usize, usize)>,
-    /// Per full site_idx: Some(active_k) if pruned AND joined to query, else None.
-    /// Length == n_sites (full, not pruned-only).
-    sites_to_active: Vec<Option<usize>>,
+    /// Per LD-independent site ld_k: Some(active_k) if joined to query, else None.
+    /// Length == n_sites_ld_indep.
+    ld_to_active: Vec<Option<usize>>,
 }
 
 fn build_site_alignment(query: &Query, pack: &DbPack) -> SiteAlignment {
@@ -94,10 +99,12 @@ fn build_site_alignment(query: &Query, pack: &DbPack) -> SiteAlignment {
     }
 
     let n_sites = pack.sites.chrom.len();
+    let n_ld_indep = pack.manifest.n_sites_ld_indep;
     let mut pairs = Vec::new();
-    let mut sites_to_active = vec![None; n_sites];
-    for (s, slot) in sites_to_active.iter_mut().enumerate() {
-        if !pack.sites.in_pruned[s] {
+    let mut ld_to_active = vec![None; n_ld_indep];
+    let mut ld_k = 0usize;
+    for s in 0..n_sites {
+        if !pack.sites.ld_indep[s] {
             continue;
         }
         let key = (
@@ -108,14 +115,38 @@ fn build_site_alignment(query: &Query, pack: &DbPack) -> SiteAlignment {
         );
         if let Some(&q_idx) = by_key.get(&key) {
             let active_k = pairs.len();
-            pairs.push((s, q_idx));
-            *slot = Some(active_k);
+            pairs.push((ld_k, q_idx));
+            ld_to_active[ld_k] = Some(active_k);
         }
+        ld_k += 1;
     }
-    SiteAlignment {
-        pairs,
-        sites_to_active,
+    SiteAlignment { pairs, ld_to_active }
+}
+
+// --- candidate genotype cache ---------------------------------------------
+
+/// Load the LD-independent genotypes for all candidates via column projection
+/// on `geno_ld_indep.parquet`. Returns a sparse map from db_idx to
+/// `(ld_k, dosage)` pairs where dosage ∈ {1, 2, DOSAGE_MISSING}.
+fn load_candidate_geno(
+    pack: &DbPack,
+    candidates: &[Candidate],
+) -> Result<HashMap<usize, Vec<(u32, u8)>>> {
+    let db_idxs: Vec<usize> = candidates.iter().map(|c| c.db_idx).collect();
+    let mat = db_pack::load_geno_ld_indep_cols(&pack.dir, &db_idxs)?;
+    let n_ld_indep = mat.shape()[0];
+    let mut geno_map = HashMap::with_capacity(candidates.len());
+    for (col, c) in candidates.iter().enumerate() {
+        let mut non_ref: Vec<(u32, u8)> = Vec::new();
+        for ld_k in 0..n_ld_indep {
+            let d = mat[[ld_k, col]];
+            if d != 0 {
+                non_ref.push((ld_k as u32, d));
+            }
+        }
+        geno_map.insert(c.db_idx, non_ref);
     }
+    Ok(geno_map)
 }
 
 // --- per-stratum candidate state -----------------------------------------
@@ -173,7 +204,7 @@ struct SiteChange {
 fn compute_swap_changes(
     drop_idx: usize,
     add_idx: usize,
-    pack: &DbPack,
+    geno: &HashMap<usize, Vec<(u32, u8)>>,
     alignment: &SiteAlignment,
     ac_query: &[u32],
     an_query: &[u32],
@@ -182,23 +213,27 @@ fn compute_swap_changes(
 ) -> Vec<SiteChange> {
     // (active_idx) → (delta_ac, delta_an), summing contributions of drop and add.
     let mut deltas: HashMap<usize, (i32, i32)> = HashMap::new();
-    for (site_idx, dosage) in pack.geno.non_ref_sites(drop_idx) {
-        if let Some(active_idx) = alignment.sites_to_active[site_idx as usize] {
-            let entry = deltas.entry(active_idx).or_insert((0, 0));
-            if dosage == DOSAGE_MISSING {
-                entry.1 += 2; // recover the 2 alleles
-            } else {
-                entry.0 -= dosage as i32;
+    if let Some(drop_sites) = geno.get(&drop_idx) {
+        for &(ld_k, dosage) in drop_sites {
+            if let Some(active_idx) = alignment.ld_to_active[ld_k as usize] {
+                let entry = deltas.entry(active_idx).or_insert((0, 0));
+                if dosage == DOSAGE_MISSING {
+                    entry.1 += 2; // recover the 2 alleles
+                } else {
+                    entry.0 -= dosage as i32;
+                }
             }
         }
     }
-    for (site_idx, dosage) in pack.geno.non_ref_sites(add_idx) {
-        if let Some(active_idx) = alignment.sites_to_active[site_idx as usize] {
-            let entry = deltas.entry(active_idx).or_insert((0, 0));
-            if dosage == DOSAGE_MISSING {
-                entry.1 -= 2;
-            } else {
-                entry.0 += dosage as i32;
+    if let Some(add_sites) = geno.get(&add_idx) {
+        for &(ld_k, dosage) in add_sites {
+            if let Some(active_idx) = alignment.ld_to_active[ld_k as usize] {
+                let entry = deltas.entry(active_idx).or_insert((0, 0));
+                if dosage == DOSAGE_MISSING {
+                    entry.1 -= 2;
+                } else {
+                    entry.0 += dosage as i32;
+                }
             }
         }
     }
@@ -295,10 +330,13 @@ pub fn run(
     let alignment = build_site_alignment(query, pack);
     if alignment.pairs.is_empty() {
         return Err(Error::Schema(
-            "no overlap between query counts and pruned db sites".into(),
+            "no overlap between query counts and LD-independent db sites".into(),
         ));
     }
     let n_active = alignment.pairs.len();
+
+    // Load candidate genotypes up-front via parquet column projection.
+    let geno = load_candidate_geno(pack, candidates)?;
 
     let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
 
@@ -371,12 +409,14 @@ pub fn run(
     let mut an_ctrl = vec![2 * n_selected; n_active];
     for state in &strata {
         for &(db_idx, _) in &state.selected {
-            for (site_idx, dosage) in pack.geno.non_ref_sites(db_idx) {
-                if let Some(active_idx) = alignment.sites_to_active[site_idx as usize] {
-                    if dosage == DOSAGE_MISSING {
-                        an_ctrl[active_idx] = an_ctrl[active_idx].saturating_sub(2);
-                    } else {
-                        ac_ctrl[active_idx] += dosage as u32;
+            if let Some(sites) = geno.get(&db_idx) {
+                for &(ld_k, dosage) in sites {
+                    if let Some(active_idx) = alignment.ld_to_active[ld_k as usize] {
+                        if dosage == DOSAGE_MISSING {
+                            an_ctrl[active_idx] = an_ctrl[active_idx].saturating_sub(2);
+                        } else {
+                            ac_ctrl[active_idx] += dosage as u32;
+                        }
                     }
                 }
             }
@@ -439,7 +479,7 @@ pub fn run(
             let add_idx = state.unselected[add_pos].0;
 
             let changes = compute_swap_changes(
-                drop_idx, add_idx, pack, &alignment, &ac_query, &an_query, &ac_ctrl, &an_ctrl,
+                drop_idx, add_idx, &geno, &alignment, &ac_query, &an_query, &ac_ctrl, &an_ctrl,
             );
             let new_lambda = lambda_after(&mut chi2, &changes);
             let new_obj = log_lambda_sq(new_lambda);
@@ -515,7 +555,6 @@ mod tests {
 
     #[test]
     fn refine_rejects_too_few_candidates() {
-        // Build a minimal valid query + pack, but pass too few candidates.
         use crate::io::db_pack;
         use crate::io::query::{Distributions, FittedGmm, Mode, Query, SnpCount};
 

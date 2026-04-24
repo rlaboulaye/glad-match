@@ -23,8 +23,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 flate2 = "1"
 polars = { version = "0.53", features = ["parquet", "lazy", "dtype-array", "dtype-u8"] }
-memmap2 = "0.9"
-
 # Errors / CLI
 anyhow = "1"
 thiserror = "2"

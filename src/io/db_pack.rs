@@ -5,29 +5,25 @@
 //! - `samples.parquet` — columns: `sample_id` (str), `sex` (u8: 0=F,1=M),
 //!   `age` (f32), `population` (str), `pc0`..`pc{n_pcs-1}` (f32 each).
 //! - `sites.parquet` — ALL single-allelic db sites. Columns: `chrom` (str),
-//!   `pos` (u64), `ref` (str), `alt` (str), `in_pruned` (bool). Row order =
+//!   `pos` (u64), `ref` (str), `alt` (str), `ld_indep` (bool). Row order =
 //!   `site_idx` in `0..n_sites`.
 //! - `geno_dense.parquet` — site-major dense dosages: one row per site, one
 //!   `uint8` column per sample (`sample_0`..`sample_{n_samples-1}`). Used by
 //!   the output writer for full-coverage per-site control counts. Loaded
 //!   on-demand with column projection so peak memory stays ~`n_sites × n_controls`
 //!   instead of `n_sites × n_samples`.
-//! - `geno_pruned.bin` — sample-major sparse payload restricted to the
-//!   pruned-set rows of `sites.parquet`: a sequence of 5-byte records
-//!   `(u32 site_idx LE, u8 dosage)`, dosage ∈ {1, 2, 255}. `site_idx` indexes
-//!   `sites.parquet` (not a pruned-only sub-index); 255 encodes a missing call.
-//! - `geno_pruned.off` — `u64 LE` offsets into `geno_pruned.bin`, length
-//!   `n_samples + 1`; sample `i`'s records live in `[offsets[i], offsets[i+1])`.
+//! - `geno_ld_indep.parquet` — same format as `geno_dense.parquet` but
+//!   restricted to the `n_sites_ld_indep` rows where `ld_indep = true`. Used
+//!   by the refinement stage with column projection onto the candidate pool
+//!   (~`n_ld_indep × n_candidates` bytes loaded at refinement start).
 //!
 //! PCA is stored as per-PC columns (`pc0`..`pc{n_pcs-1}`) rather than a
 //! fixed-size-list. Same storage cost after parquet encoding, simpler to
 //! produce/consume on both sides.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use memmap2::Mmap;
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::Deserialize;
@@ -41,7 +37,7 @@ pub struct Manifest {
     pub n_samples: usize,
     pub n_pcs: usize,
     pub n_sites: usize,
-    pub n_sites_pruned: usize,
+    pub n_sites_ld_indep: usize,
     pub age_mean: f64,
     pub age_sd: f64,
     #[serde(default)]
@@ -64,61 +60,20 @@ pub struct Sites {
     pub pos: Vec<u64>,
     pub ref_allele: Vec<String>,
     pub alt_allele: Vec<String>,
-    /// True if this site is in the LD-pruned subset. Refinement only joins
-    /// against pruned sites; the output writer ignores this flag and emits
-    /// every site.
-    pub in_pruned: Vec<bool>,
-}
-
-/// Sample-major sparse non-ref genotype store over the pruned site set.
-pub struct GenoPruned {
-    payload: Mmap,
-    offsets: Vec<u64>,
+    /// True if this site is in the LD-independent (LD-pruning survivors) subset
+    /// used for refinement. The output writer ignores this flag and emits every site.
+    pub ld_indep: Vec<bool>,
 }
 
 pub const DOSAGE_MISSING: u8 = 255;
 
-impl GenoPruned {
-    pub fn n_samples(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
-    }
-
-    /// Iterate `(site_idx, dosage)` for the given sample. Dosage is 1 or 2 for
-    /// present non-ref calls, or [`DOSAGE_MISSING`] for missing calls.
-    pub fn non_ref_sites(&self, sample_idx: usize) -> GenoIter<'_> {
-        let start = self.offsets[sample_idx] as usize;
-        let end = self.offsets[sample_idx + 1] as usize;
-        GenoIter {
-            slice: &self.payload[start..end],
-        }
-    }
-}
-
-pub struct GenoIter<'a> {
-    slice: &'a [u8],
-}
-
-impl Iterator for GenoIter<'_> {
-    type Item = (u32, u8);
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.slice.len() < 5 {
-            return None;
-        }
-        let site = u32::from_le_bytes(self.slice[..4].try_into().ok()?);
-        let dosage = self.slice[4];
-        self.slice = &self.slice[5..];
-        Some((site, dosage))
-    }
-}
-
 pub struct DbPack {
-    /// Source directory; needed to lazily project columns out of
-    /// `geno_dense.parquet` at output time.
+    /// Source directory; needed to lazily project columns out of parquet files
+    /// at output time and refinement start.
     pub dir: PathBuf,
     pub manifest: Manifest,
     pub samples: DbSamples,
     pub sites: Sites,
-    pub geno: GenoPruned,
 }
 
 pub fn load<P: AsRef<Path>>(dir: P) -> Result<DbPack> {
@@ -126,7 +81,6 @@ pub fn load<P: AsRef<Path>>(dir: P) -> Result<DbPack> {
     let manifest = load_manifest(&dir)?;
     let samples = load_samples(&dir, manifest.n_pcs)?;
     let sites = load_sites(&dir)?;
-    let geno = load_geno(&dir)?;
 
     if samples.sample_ids.len() != manifest.n_samples {
         return Err(Error::Schema(format!(
@@ -142,18 +96,11 @@ pub fn load<P: AsRef<Path>>(dir: P) -> Result<DbPack> {
             sites.chrom.len()
         )));
     }
-    let in_pruned_count = sites.in_pruned.iter().filter(|&&p| p).count();
-    if in_pruned_count != manifest.n_sites_pruned {
+    let ld_indep_count = sites.ld_indep.iter().filter(|&&p| p).count();
+    if ld_indep_count != manifest.n_sites_ld_indep {
         return Err(Error::Schema(format!(
-            "manifest.n_sites_pruned={} but sites.in_pruned has {} true entries",
-            manifest.n_sites_pruned, in_pruned_count
-        )));
-    }
-    if geno.n_samples() != manifest.n_samples {
-        return Err(Error::Schema(format!(
-            "manifest.n_samples={} but geno_pruned.off encodes {} samples",
-            manifest.n_samples,
-            geno.n_samples()
+            "manifest.n_sites_ld_indep={} but sites.ld_indep has {} true entries",
+            manifest.n_sites_ld_indep, ld_indep_count
         )));
     }
 
@@ -162,7 +109,6 @@ pub fn load<P: AsRef<Path>>(dir: P) -> Result<DbPack> {
         manifest,
         samples,
         sites,
-        geno,
     })
 }
 
@@ -227,18 +173,28 @@ fn load_sites(dir: &Path) -> Result<Sites> {
         pos: u64_column(&df, "pos")?,
         ref_allele: str_column(&df, "ref")?,
         alt_allele: str_column(&df, "alt")?,
-        in_pruned: bool_column(&df, "in_pruned")?,
+        ld_indep: bool_column(&df, "ld_indep")?,
     })
 }
 
-/// Read the dense geno table for the given sample subset, projecting only
-/// those `sample_{idx}` columns out of parquet (so memory is
-/// `n_sites × selected.len()` rather than `n_sites × n_samples`).
+/// Project the given sample columns from `geno_dense.parquet`.
 ///
 /// Returned shape: `(n_sites, selected.len())`. Dosages: 0/1/2 for present
 /// genotypes, [`DOSAGE_MISSING`] for missing.
 pub fn load_geno_dense_cols(dir: &Path, selected: &[usize]) -> Result<Array2<u8>> {
-    let path = dir.join("geno_dense.parquet");
+    load_geno_cols(dir, "geno_dense.parquet", selected)
+}
+
+/// Project the given sample columns from `geno_ld_indep.parquet`.
+///
+/// Returned shape: `(n_sites_ld_indep, selected.len())`. Dosages: 0/1/2 for
+/// present genotypes, [`DOSAGE_MISSING`] for missing.
+pub fn load_geno_ld_indep_cols(dir: &Path, selected: &[usize]) -> Result<Array2<u8>> {
+    load_geno_cols(dir, "geno_ld_indep.parquet", selected)
+}
+
+fn load_geno_cols(dir: &Path, filename: &str, selected: &[usize]) -> Result<Array2<u8>> {
+    let path = dir.join(filename);
     let file = File::open(&path).map_err(|source| Error::Io {
         path: path.clone(),
         source,
@@ -248,14 +204,14 @@ pub fn load_geno_dense_cols(dir: &Path, selected: &[usize]) -> Result<Array2<u8>
         .with_columns(Some(col_names.clone()))
         .finish()?;
 
-    let n_sites = df.height();
+    let n_rows = df.height();
     let m = selected.len();
-    let mut arr = Array2::<u8>::zeros((n_sites, m));
+    let mut arr = Array2::<u8>::zeros((n_rows, m));
     for (j, name) in col_names.iter().enumerate() {
         let col = u8_column(&df, name)?;
-        if col.len() != n_sites {
+        if col.len() != n_rows {
             return Err(Error::Schema(format!(
-                "geno_dense column {name} has {} rows, expected {n_sites}",
+                "{filename} column {name} has {} rows, expected {n_rows}",
                 col.len()
             )));
         }
@@ -264,55 +220,6 @@ pub fn load_geno_dense_cols(dir: &Path, selected: &[usize]) -> Result<Array2<u8>
         }
     }
     Ok(arr)
-}
-
-fn load_geno(dir: &Path) -> Result<GenoPruned> {
-    let off_path = dir.join("geno_pruned.off");
-    let mut off_file = File::open(&off_path).map_err(|source| Error::Io {
-        path: off_path.clone(),
-        source,
-    })?;
-    let mut raw = Vec::new();
-    off_file
-        .read_to_end(&mut raw)
-        .map_err(|source| Error::Io {
-            path: off_path.clone(),
-            source,
-        })?;
-    if raw.len() % 8 != 0 {
-        return Err(Error::Schema(format!(
-            "geno_pruned.off size {} is not a multiple of 8",
-            raw.len()
-        )));
-    }
-    let offsets: Vec<u64> = raw
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    if offsets.is_empty() {
-        return Err(Error::Schema("empty geno_pruned.off".into()));
-    }
-
-    let payload_path = dir.join("geno_pruned.bin");
-    let payload_file = File::open(&payload_path).map_err(|source| Error::Io {
-        path: payload_path.clone(),
-        source,
-    })?;
-    let payload = unsafe { Mmap::map(&payload_file) }.map_err(|source| Error::Io {
-        path: payload_path.clone(),
-        source,
-    })?;
-
-    let expected = *offsets.last().unwrap() as usize;
-    if payload.len() < expected {
-        return Err(Error::Schema(format!(
-            "geno_pruned.bin size {} is less than last offset {}",
-            payload.len(),
-            expected
-        )));
-    }
-
-    Ok(GenoPruned { payload, offsets })
 }
 
 // --- small polars helpers -------------------------------------------------
@@ -374,7 +281,6 @@ fn f32_column(df: &DataFrame, name: &str) -> Result<Vec<f32>> {
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::*;
-    use std::io::Write;
 
     /// Build a tiny db_pack in `dir` for tests using deterministic synthetic
     /// site positions (chrom "1", pos = 100 + i*10, ref "A", alt "G").
@@ -390,7 +296,7 @@ pub(crate) mod fixture {
 
     /// Like [`build`] but uses caller-provided site coordinates so tests can
     /// exercise the join against a real query's allele list. All fixture
-    /// sites are flagged `in_pruned = true`.
+    /// sites are flagged `ld_indep = true`.
     pub fn build_with_sites(
         dir: &Path,
         n_samples: usize,
@@ -404,7 +310,7 @@ pub(crate) mod fixture {
             "n_samples": n_samples,
             "n_pcs": n_pcs,
             "n_sites": n_sites,
-            "n_sites_pruned": n_sites,
+            "n_sites_ld_indep": n_sites,
             "age_mean": 50.0_f64,
             "age_sd": 10.0_f64
         });
@@ -441,7 +347,7 @@ pub(crate) mod fixture {
         let site_pos_i64: Vec<i64> = sites.iter().map(|(_, p, _, _)| *p as i64).collect();
         let site_ref_refs: Vec<&str> = sites.iter().map(|(_, _, r, _)| r.as_str()).collect();
         let site_alt_refs: Vec<&str> = sites.iter().map(|(_, _, _, a)| a.as_str()).collect();
-        let in_pruned: Vec<bool> = vec![true; n_sites];
+        let ld_indep: Vec<bool> = vec![true; n_sites];
         let mut sdf = DataFrame::new(
             n_sites,
             vec![
@@ -449,54 +355,51 @@ pub(crate) mod fixture {
                 Column::new("pos".into(), site_pos_i64.as_slice()),
                 Column::new("ref".into(), site_ref_refs.as_slice()),
                 Column::new("alt".into(), site_alt_refs.as_slice()),
-                Column::new("in_pruned".into(), in_pruned.as_slice()),
+                Column::new("ld_indep".into(), ld_indep.as_slice()),
             ],
         )
         .unwrap();
         let out = File::create(dir.join("sites.parquet")).unwrap();
         ParquetWriter::new(out).finish(&mut sdf).unwrap();
 
-        // geno_dense.parquet: one row per site, one column per sample.
-        // Match the fixture's sparse pattern: sample i has dosage 1 at site
-        // (i % n_sites) and dosage 2 at site ((i+1) % n_sites), 0 elsewhere.
+        // Both geno_dense.parquet and geno_ld_indep.parquet use the same layout:
+        // one row per site, one column per sample (sample_0..sample_{n-1}).
+        // Since all fixture sites are ld_indep, both files are identical here.
         // Polars' default features don't include UInt8, so write as Int32 —
         // u8_column casts back on read.
-        let mut dense_cols: Vec<Vec<i32>> = vec![vec![0; n_sites]; n_samples];
-        for (i, row) in dense_cols.iter_mut().enumerate() {
+        let geno = build_geno_matrix(n_samples, n_sites);
+        write_geno_parquet(dir, "geno_dense.parquet", &geno, n_samples, n_sites);
+        write_geno_parquet(dir, "geno_ld_indep.parquet", &geno, n_samples, n_sites);
+    }
+
+    fn build_geno_matrix(n_samples: usize, n_sites: usize) -> Vec<Vec<i32>> {
+        // Column-indexed: dense_cols[sample_idx][site_idx]
+        // Sample i has dosage 1 at site (i % n_sites) and dosage 2 at site
+        // ((i+1) % n_sites), 0 elsewhere.
+        let mut cols: Vec<Vec<i32>> = vec![vec![0; n_sites]; n_samples];
+        for (i, row) in cols.iter_mut().enumerate() {
             let s1 = i % n_sites;
             let s2 = (i + 1) % n_sites;
             row[s1] = 1;
             row[s2] = 2;
         }
-        let mut dense_columns: Vec<Column> = Vec::with_capacity(n_samples);
-        for (i, col) in dense_cols.iter().enumerate() {
-            dense_columns.push(Column::new(
-                format!("sample_{i}").into(),
-                col.as_slice(),
-            ));
-        }
-        let mut ddf = DataFrame::new(n_sites, dense_columns).unwrap();
-        let out = File::create(dir.join("geno_dense.parquet")).unwrap();
-        ParquetWriter::new(out).finish(&mut ddf).unwrap();
+        cols
+    }
 
-        // geno_pruned.bin: site_idx values index into sites.parquet (== full
-        // site indexing since fixture has no non-pruned sites).
-        let mut offsets: Vec<u64> = vec![0];
-        let mut payload: Vec<u8> = Vec::new();
-        for i in 0..n_samples {
-            let s1 = (i % n_sites) as u32;
-            let s2 = ((i + 1) % n_sites) as u32;
-            payload.extend_from_slice(&s1.to_le_bytes());
-            payload.push(1);
-            payload.extend_from_slice(&s2.to_le_bytes());
-            payload.push(2);
-            offsets.push(payload.len() as u64);
+    fn write_geno_parquet(
+        dir: &Path,
+        filename: &str,
+        cols: &[Vec<i32>],
+        n_samples: usize,
+        n_sites: usize,
+    ) {
+        let mut columns: Vec<Column> = Vec::with_capacity(n_samples);
+        for (i, col) in cols.iter().enumerate() {
+            columns.push(Column::new(format!("sample_{i}").into(), col.as_slice()));
         }
-        std::fs::write(dir.join("geno_pruned.bin"), &payload).unwrap();
-        let mut off_file = File::create(dir.join("geno_pruned.off")).unwrap();
-        for &o in &offsets {
-            off_file.write_all(&o.to_le_bytes()).unwrap();
-        }
+        let mut ddf = DataFrame::new(n_sites, columns).unwrap();
+        let out = File::create(dir.join(filename)).unwrap();
+        ParquetWriter::new(out).finish(&mut ddf).unwrap();
     }
 }
 
@@ -514,17 +417,35 @@ mod tests {
         assert_eq!(pack.samples.sample_ids.len(), 5);
         assert_eq!(pack.samples.pca.shape(), &[5, 3]);
         assert_eq!(pack.manifest.n_sites, 4);
+        assert_eq!(pack.manifest.n_sites_ld_indep, 4);
         assert_eq!(pack.sites.chrom.len(), 4);
-        assert!(pack.sites.in_pruned.iter().all(|&p| p));
-        assert_eq!(pack.geno.n_samples(), 5);
+        assert!(pack.sites.ld_indep.iter().all(|&p| p));
 
         // pca[i, j] = (i * n_pcs + j) * 0.01
         approx::assert_abs_diff_eq!(pack.samples.pca[(2, 1)], 0.07, epsilon = 1e-6);
+    }
 
-        // Sample 2 → [(2, 1), (3, 2)] in full-site indexing (== pruned-only
-        // indexing in the fixture since all sites are pruned).
-        let sites: Vec<_> = pack.geno.non_ref_sites(2).collect();
-        assert_eq!(sites, vec![(2, 1), (3, 2)]);
+    #[test]
+    fn geno_dense_cols_roundtrip() {
+        let tmp = tempdir().unwrap();
+        fixture::build(tmp.path(), 5, 3, 4);
+        // Sample 2: dosage 1 at site 2, dosage 2 at site 3
+        let mat = load_geno_dense_cols(tmp.path(), &[2]).unwrap();
+        assert_eq!(mat.shape(), &[4, 1]);
+        assert_eq!(mat[[2, 0]], 1);
+        assert_eq!(mat[[3, 0]], 2);
+        assert_eq!(mat[[0, 0]], 0);
+    }
+
+    #[test]
+    fn geno_ld_indep_cols_roundtrip() {
+        let tmp = tempdir().unwrap();
+        fixture::build(tmp.path(), 5, 3, 4);
+        // Same pattern as dense since all fixture sites are ld_indep
+        let mat = load_geno_ld_indep_cols(tmp.path(), &[2]).unwrap();
+        assert_eq!(mat.shape(), &[4, 1]);
+        assert_eq!(mat[[2, 0]], 1);
+        assert_eq!(mat[[3, 0]], 2);
     }
 
     #[test]
@@ -533,7 +454,7 @@ mod tests {
         fixture::build(tmp.path(), 5, 3, 4);
         let bad = serde_json::json!({
             "version": "1.0", "reference_build": "GRCh38",
-            "n_samples": 999, "n_pcs": 3, "n_sites": 4, "n_sites_pruned": 4,
+            "n_samples": 999, "n_pcs": 3, "n_sites": 4, "n_sites_ld_indep": 4,
             "age_mean": 50.0, "age_sd": 10.0
         });
         std::fs::write(tmp.path().join("manifest.json"), bad.to_string()).unwrap();

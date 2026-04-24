@@ -930,7 +930,6 @@ dependencies = [
  "approx",
  "clap",
  "flate2",
- "memmap2",
  "ndarray",
  "polars",
  "rand 0.9.4",

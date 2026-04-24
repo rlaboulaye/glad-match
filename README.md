@@ -27,11 +27,11 @@ uv pip install numpy pyarrow cyvcf2 polars
 
 | File | Description |
 |---|---|
-| `manifest.json` | Shape constants (`n_samples`, `n_pcs`, `n_sites`, `n_sites_pruned`) and age normalization parameters (`age_mean`, `age_sd`) |
+| `manifest.json` | Shape constants (`n_samples`, `n_pcs`, `n_sites`, `n_sites_ld_indep`) and age normalization parameters (`age_mean`, `age_sd`) |
 | `samples.parquet` | Per-sample metadata: `sample_id`, `sex` (0=F, 1=M), `age`, `population`, `pc0`…`pc{n_pcs-1}` |
-| `sites.parquet` | All db sites: `chrom`, `pos`, `ref`, `alt`, `in_pruned` |
-| `geno_dense.parquet` | Site-major dosage matrix (one row per site, one `uint8` column per sample named `sample_0`…`sample_{n-1}`; dosages 0/1/2/255) |
-| `geno_pruned.bin` + `.off` | Sample-major sparse records for the LD-pruned subset; used internally by the refinement stage |
+| `sites.parquet` | All db sites: `chrom`, `pos`, `ref`, `alt`, `ld_indep` |
+| `geno_dense.parquet` | Site-major dosage matrix (one row per site, one `uint8` column per sample named `sample_0`…`sample_{n-1}`; dosages 0/1/2/255). Used by the output writer for full-site coverage. |
+| `geno_ld_indep.parquet` | Same layout as `geno_dense.parquet`, restricted to the `n_sites_ld_indep` rows where `ld_indep = true`. Used by the refinement stage with column projection onto the candidate pool. |
 
 ### Building a `db_pack` from raw data
 
