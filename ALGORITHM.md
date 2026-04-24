@@ -201,13 +201,11 @@ End-to-end target on a workstation is single-digit minutes for production-sized 
 
 ## 10. Limitations and future work
 
-- **All-site output** (currently bounded to the pruned set) requires glad-prep to emit allele counts at all sites, not just the LD-pruned set used for $\lambda$.
 - **Strict sex / age matching** is not yet exposed. The filter layer is the right home: pre-restrict the db to a tight age window and/or only one sex, then run the existing pipeline.
 - **phs-cohort exclusion** is wired through `FilterSpec` but waits on a `phs_cohort` column being added to the preprocessed db_pack.
 - **Differential privacy** on the aggregate demographics output is not yet applied; k-anonymity suppression is a first cut.
 - **BIC-based GMM component selection** in glad-prep would pick smaller $K$ for small queries and larger $K$ for big ones; the current heuristic ($K = n_Q / 200$, capped at 8) is a placeholder.
 - **Refinement median structure**: a heap-or-tree-backed running median would replace the per-evaluation $O(|\mathcal{S}_a|)$ scan with $O(\log |\mathcal{S}_a|)$ updates if profiling identifies the median as a bottleneck on production-sized inputs.
-- **Benchmark vs. prior approach** on the same simulated and real cohorts is the publication-blocking item.
 
 ## 11. References
 
