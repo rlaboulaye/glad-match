@@ -285,12 +285,14 @@ fn stratum_pipeline(
     pool_size: usize,
     params: &MatchParams,
 ) -> Result<(Vec<Candidate>, SinkhornRunInfo)> {
+    let pc_sd = 1.0 / (pack.manifest.n_samples as f64).sqrt();
     let features_mat = features::build(
         &pack.samples,
         db_indices,
         layout,
         pack.manifest.age_mean,
         pack.manifest.age_sd,
+        pc_sd,
     )?;
     let cost_mat = cost::mahalanobis(&features_mat, gmm)?;
     let a = ot::uniform_source(db_indices.len());

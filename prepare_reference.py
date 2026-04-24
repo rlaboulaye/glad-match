@@ -69,11 +69,9 @@ def compute_allele_freqs(db_pack_path: Path) -> pl.DataFrame:
     dosage_f = geno_np.astype(np.float32)
     dosage_f[geno_np == 255] = np.nan
     alt_freq = np.nanmean(dosage_f, axis=1) / 2.0
-    genotypic_std = np.nanstd(dosage_f, axis=1)
 
     return sites.select(["chrom", "pos", "alt"]).with_columns(
         pl.Series("alt_freq", alt_freq, dtype=pl.Float64),
-        pl.Series("genotypic_std", genotypic_std, dtype=pl.Float64),
     )
 
 
@@ -128,7 +126,7 @@ def main():
     freqs_j = freqs.with_columns(pl.col("chrom").str.strip_prefix("chr").alias("_chrom_norm"))
 
     weights = weights_j.join(
-        freqs_j.select(["_chrom_norm", "pos", "alt", "alt_freq", "genotypic_std"]),
+        freqs_j.select(["_chrom_norm", "pos", "alt", "alt_freq"]),
         on=["_chrom_norm", "pos"],
         how="left",
     ).drop("_chrom_norm")
@@ -147,7 +145,7 @@ def main():
         weights = weights.filter(pl.col("effect_allele_freq").is_not_null())
     print(f"  Frequencies computed for {len(weights):,} SNPs")
 
-    out_cols = ["chrom", "pos", "effect_allele", "other_allele", "effect_allele_freq", "genotypic_std"] + PC_COLS
+    out_cols = ["chrom", "pos", "effect_allele", "other_allele", "effect_allele_freq"] + PC_COLS
     out_path = root / "glad_pca_weights.tsv.gz"
     with gzip.open(out_path, "wb") as f:
         weights.select(out_cols).write_csv(f, separator="\t")
@@ -160,10 +158,12 @@ def main():
     age_sd = float(db_meta["age"].std())
     print(f"  n={len(db_meta):,}  age_mean={age_mean:.3f}  age_sd={age_sd:.3f}")
 
+    n_db = len(db_meta)
     glad_meta = {
         "reference_build": "GRCh38",
         "n_pcs": N_PCS,
         "n_snps": len(weights),
+        "n_db_samples": n_db,
         "age_mean": age_mean,
         "age_sd": age_sd,
     }

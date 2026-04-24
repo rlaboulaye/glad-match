@@ -52,6 +52,7 @@ pub fn build(
     layout: FeatureLayout,
     age_mean: f64,
     age_sd: f64,
+    pc_sd: f64,
 ) -> Result<Array2<f32>> {
     let available_pcs = samples.pca.shape()[1];
     if layout.n_pcs_used > available_pcs {
@@ -75,7 +76,7 @@ pub fn build(
         }
         if layout.include_age {
             let age = samples.age[idx] as f64;
-            let z = (age - age_mean) / age_sd;
+            let z = (age - age_mean) / age_sd * pc_sd;
             features[(row, layout.n_pcs_used)] = z as f32;
         }
     }
@@ -145,7 +146,7 @@ mod tests {
             n_pcs_used: 2,
             include_age: false,
         };
-        let f = build(&pack.samples, &[0, 2], layout, 50.0, 10.0).unwrap();
+        let f = build(&pack.samples, &[0, 2], layout, 50.0, 10.0, 1.0).unwrap();
         assert_eq!(f.shape(), &[2, 2]);
         // fixture PCA: pca[i, j] = (i * n_pcs + j) * 0.01
         approx::assert_abs_diff_eq!(f[(0, 0)], 0.0, epsilon = 1e-6);
@@ -155,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn build_with_age_zscored() {
+    fn build_with_age_zscored_and_scaled() {
         let (_tmp, pack) = load_small(3, 2, 2);
         let layout = FeatureLayout {
             n_pcs_used: 2,
@@ -163,12 +164,13 @@ mod tests {
         };
         let age_mean = 40.0_f64;
         let age_sd = 1.0_f64;
-        let f = build(&pack.samples, &[0, 1, 2], layout, age_mean, age_sd).unwrap();
+        let pc_sd = 0.5_f64;
+        let f = build(&pack.samples, &[0, 1, 2], layout, age_mean, age_sd, pc_sd).unwrap();
         assert_eq!(f.shape(), &[3, 3]);
-        // fixture age[i] = 40.0 + i → z = i
+        // fixture age[i] = 40.0 + i → z = i → scaled = i * pc_sd
         approx::assert_abs_diff_eq!(f[(0, 2)], 0.0, epsilon = 1e-6);
-        approx::assert_abs_diff_eq!(f[(1, 2)], 1.0, epsilon = 1e-6);
-        approx::assert_abs_diff_eq!(f[(2, 2)], 2.0, epsilon = 1e-6);
+        approx::assert_abs_diff_eq!(f[(1, 2)], 0.5, epsilon = 1e-6);
+        approx::assert_abs_diff_eq!(f[(2, 2)], 1.0, epsilon = 1e-6);
     }
 
     #[test]
@@ -178,7 +180,7 @@ mod tests {
             n_pcs_used: 5,
             include_age: false,
         };
-        assert!(build(&pack.samples, &[0], layout, 0.0, 1.0).is_err());
+        assert!(build(&pack.samples, &[0], layout, 0.0, 1.0, 1.0).is_err());
     }
 
     #[test]
