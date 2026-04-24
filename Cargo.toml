@@ -3,4 +3,42 @@ name = "glad-match"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "glad_match"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glad-match"
+path = "src/main.rs"
+
 [dependencies]
+# Optimal transport
+wass = "0.2"
+
+# Numerical / ndarray (ndarray 0.16 to match wass)
+ndarray = "0.16"
+
+# Serialization / I/O
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+polars = { version = "0.53", features = ["parquet", "lazy", "dtype-array", "dtype-u8"] }
+memmap2 = "0.9"
+
+# Errors / CLI
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+# Randomness (0.9 to match wass)
+rand = "0.9"
+rand_chacha = "0.9"
+
+# Parallelism / logging
+rayon = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"
