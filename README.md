@@ -1,4 +1,4 @@
-# glad-match
+# CLOISTR <br> <sub>Controls via Latent-space Optimization using Inferred Statistical TRansport</sub>
 
 Select ancestry-, age-, and sex-matched genomic controls from the GLAD database for a query cohort, returning only aggregate allele and genotype counts — no individual-level data crosses either direction.
 
