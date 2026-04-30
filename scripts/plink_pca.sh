@@ -15,9 +15,9 @@ plink --bfile pca/db \
       --indep-pairwise 50 10 0.1 \
       --out pca/db
 
-# PCA on pruned SNPs, keep top 30 PCs, output variant weights as well
+# PCA on pruned SNPs, keep top 20 PCs, output variant weights as well
 plink --bfile pca/db \
       --threads $NTHREADS \
       --extract pca/db.prune.in \
-      --pca 30 var-wts \
+      --pca 20 var-wts \
       --out pca/db_pca

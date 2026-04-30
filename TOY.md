@@ -72,7 +72,7 @@ plink --bfile pca/toy_db \
 
 plink --bfile pca/toy_db \
       --extract pca/toy_db.prune.in \
-      --pca 30 var-wts \
+      --pca 20 var-wts \
       --out pca/toy_db_pca
 ```
 
